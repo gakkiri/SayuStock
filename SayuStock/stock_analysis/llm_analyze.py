@@ -26,10 +26,17 @@ KIMI_BASE_URL = "https://api.moonshot.cn/v1"
 KIMI_MODEL = "kimi-k2.5"
 MAX_RETRIES = 5
 RETRY_DELAY = 5  # 秒
+REQUEST_TIMEOUT = 90  # 单轮请求超时（秒）
+MAX_ROUNDS = 8  # 单次调用最多循环轮数
 
-SYSTEM_PROMPT = """你是一位专业的 A 股分析师，擅长结合技术面与舆情做出研判。
-搜索完成后，输出格式严格如下，用 |sep| 分隔五个部分，不要有其他任何多余内容：
-多空判断（看多/看空/中性，一句话，不超过20字）|sep|核心理由（技术面一条+舆情一条，合计不超过100字，可用markdown加粗关键词）|sep|风险提示（一条，不超过40字）|sep|舆情摘要（对近期新闻公告的一句话概括，不超过60字）|sep|信源列表（每条格式严格为"来源名称(MM-DD): 内容摘要"，多条之间用 ;; 分隔，不超过5条，例如：新浪财经(02-28): 茅台发布年报营收同比增长15%;;东方财富公告(02-27): 公司拟回购股票不超过5亿元;;雪球(02-26): 机构大幅增持，市场情绪偏多）"""
+SYSTEM_PROMPT = """你是一位专业的 A 股分析师。搜索完成后，【直接】输出下面的格式，不要输出任何搜索过程、分析过程、思考内容或其他额外文字，只输出五段用 |sep| 分隔的内容：
+多空判断（看多/看空/中性，不超过20字）|sep|核心理由（技术面一条+舆情一条，合计不超过100字，可用markdown加粗关键词）|sep|风险提示（一条，不超过40字）|sep|舆情摘要（对近期新闻公告的一句话概括，不超过60字）|sep|信源列表（每条格式严格为"来源名称(MM-DD): 内容摘要"，多条之间用 ;; 分隔，不超过5条，例如：新浪财经(02-28): 茅台发布年报营收同比增长15%;;东方财富公告(02-27): 公司拟回购股票不超过5亿元）
+除上述五段内容外，不得输出任何其他文字。"""
+
+
+def _clean_part(text: str) -> str:
+    """剥掉 Kimi 可能附加的 **标签名**： 前缀，并去除首尾空白。"""
+    return re.sub(r'^\*\*[^*]+\*\*[：:]\s*', '', text.strip())
 
 
 def search_impl(arguments: Dict[str, Any]) -> Any:
@@ -85,13 +92,21 @@ async def _kimi_call(
     rounds = 0
     while finish_reason is None or finish_reason == "tool_calls":
         rounds += 1
+        if rounds > MAX_ROUNDS:
+            raise ValueError(f"Kimi 循环超过 {MAX_ROUNDS} 轮，强制终止")
         logger.info(f"[SayuStock] Kimi 第{rounds}轮请求（finish_reason={finish_reason}）")
-        completion = await client.chat.completions.create(
-            model=KIMI_MODEL,
-            messages=messages,
-            extra_body={"thinking": {"type": "disabled"}},
-            tools=tools,
-        )
+        try:
+            completion = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=KIMI_MODEL,
+                    messages=messages,
+                    extra_body={"thinking": {"type": "disabled"}},
+                    tools=tools,
+                ),
+                timeout=REQUEST_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise ValueError(f"Kimi 第{rounds}轮请求超时（>{REQUEST_TIMEOUT}s）")
         choice = completion.choices[0]
         finish_reason = choice.finish_reason
         logger.info(f"[SayuStock] Kimi 响应 finish_reason={finish_reason}")
@@ -121,11 +136,16 @@ async def _kimi_call(
     if len(parts) < 2:
         raise ValueError(f"Kimi 回答格式不符（parts={len(parts)}），原始内容: {raw[:200]}")
 
-    verdict      = parts[0] if len(parts) > 0 else "中性"
-    reason       = parts[1] if len(parts) > 1 else "暂无分析"
-    risk         = parts[2] if len(parts) > 2 else "注意市场风险"
-    news_summary = parts[3] if len(parts) > 3 else ""
-    sources_raw  = parts[4] if len(parts) > 4 else ""
+    # parts[0] 可能含大量前置思考文本，只取最后一个非空行作为 verdict
+    verdict_lines = [l.strip() for l in parts[0].split('\n') if l.strip()]
+    verdict = _clean_part(verdict_lines[-1]) if verdict_lines else "中性"
+    if len(verdict) > 30:
+        raise ValueError(f"verdict 格式异常（{len(verdict)}字），疑似未按格式输出，原始内容: {raw[:200]}")
+
+    reason       = _clean_part(parts[1]) if len(parts) > 1 else "暂无分析"
+    risk         = _clean_part(parts[2]) if len(parts) > 2 else "注意市场风险"
+    news_summary = _clean_part(parts[3]) if len(parts) > 3 else ""
+    sources_raw  = _clean_part(parts[4]) if len(parts) > 4 else ""
     # 优先按 ;; 分割，回退到换行/顿号/逗号
     sources = [s.strip() for s in sources_raw.split(';;') if s.strip()]
     if not sources:
@@ -155,4 +175,4 @@ async def kimi_analyze(
                 await asyncio.sleep(RETRY_DELAY)
 
     logger.error(f"[SayuStock] Kimi 全部{MAX_RETRIES}次重试均失败，最后错误: {last_err}")
-    return "中性", f"AI分析失败（{last_err}）", "注意市场风险", "", []
+    raise last_err

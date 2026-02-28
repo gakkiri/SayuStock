@@ -45,5 +45,11 @@ async def send_stock_analysis(bot: Bot, ev: Event):
 
     except Exception as e:
         logger.exception(f"[SayuStock][大盘分析] 出现异常: {e}")
-        await bot.send(f"分析出错: {e}")
+        err_str = str(e)
+        if "超时" in err_str:
+            await bot.send("AI 分析超时，请稍后重试")
+        elif "格式" in err_str or "format" in err_str.lower():
+            await bot.send("AI 返回格式异常，请稍后重试")
+        else:
+            await bot.send(f"分析出错: {e}")
 
