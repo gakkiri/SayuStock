@@ -76,8 +76,10 @@ async def _kimi_call(
             "content": (
                 f"{tech_summary}\n\n"
                 f"今天是 {date.today().strftime('%Y-%m-%d')}，"
-                f"请搜索【{stock_name}】近半年（{(date.today() - timedelta(days=180)).strftime('%Y-%m-%d')} 至今）的新闻、公告、市场舆情，"
-                f"结合以上技术面数据，按要求格式给出分析结论。"
+                f"请分两部分搜索：\n"
+                f"1. 【{stock_name}】近半年（{(date.today() - timedelta(days=180)).strftime('%Y-%m-%d')} 至今）的新闻、公告、市场舆情；\n"
+                f"2. 近期可能影响 A 股整体走势的重大宏观事件（如政策变化、经济数据、国际局势等）。\n"
+                f"结合以上技术面数据及搜索结果，按要求格式给出分析结论。"
             ),
         },
     ]
