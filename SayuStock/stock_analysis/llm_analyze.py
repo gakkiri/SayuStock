@@ -3,6 +3,7 @@ import re
 import json
 import logging
 import asyncio
+from datetime import date, timedelta
 from typing import Any, Dict, List, Tuple
 from pathlib import Path
 
@@ -30,7 +31,7 @@ REQUEST_TIMEOUT = 90  # 单轮请求超时（秒）
 MAX_ROUNDS = 8  # 单次调用最多循环轮数
 
 SYSTEM_PROMPT = """你是一位专业的 A 股分析师。搜索完成后，【直接】输出下面的格式，不要输出任何搜索过程、分析过程、思考内容或其他额外文字，只输出五段用 |sep| 分隔的内容：
-多空判断（看多/看空/中性，不超过20字）|sep|核心理由（技术面一条+舆情一条，合计不超过100字，可用markdown加粗关键词）|sep|风险提示（一条，不超过40字）|sep|舆情摘要（对近期新闻公告的一句话概括，不超过60字）|sep|信源列表（每条格式严格为"来源名称(MM-DD): 内容摘要"，多条之间用 ;; 分隔，不超过5条，例如：新浪财经(02-28): 茅台发布年报营收同比增长15%;;东方财富公告(02-27): 公司拟回购股票不超过5亿元）
+多空判断（看多/看空/中性，不超过20字）|sep|核心理由（技术面一条+舆情一条，合计不超过100字，可用markdown加粗关键词）|sep|风险提示（一条，不超过40字）|sep|舆情摘要（对近期新闻公告的一句话概括，不超过60字）|sep|信源列表（每条格式严格为"来源名称(YYYY-MM-DD): 内容摘要"，多条之间用 ;; 分隔，不超过5条，例如：新浪财经(2026-02-28): 茅台发布年报营收同比增长15%;;东方财富公告(2026-02-27): 公司拟回购股票不超过5亿元）
 除上述五段内容外，不得输出任何其他文字。"""
 
 
@@ -74,7 +75,8 @@ async def _kimi_call(
             "role": "user",
             "content": (
                 f"{tech_summary}\n\n"
-                f"请搜索【{stock_name}】近期新闻、公告、市场舆情，"
+                f"今天是 {date.today().strftime('%Y-%m-%d')}，"
+                f"请搜索【{stock_name}】近半年（{(date.today() - timedelta(days=180)).strftime('%Y-%m-%d')} 至今）的新闻、公告、市场舆情，"
                 f"结合以上技术面数据，按要求格式给出分析结论。"
             ),
         },
