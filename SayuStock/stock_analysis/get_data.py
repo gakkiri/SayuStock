@@ -38,39 +38,240 @@ def _parse_kline_df(raw_data: Dict) -> Optional[pd.DataFrame]:
 
 def _build_tech_summary(df: pd.DataFrame, stock_name: str, current_price: float) -> str:
     """根据 DataFrame 生成技术面文字摘要，供 LLM 使用。"""
-    close = df["close"]
+    close  = df["close"]
+    high   = df["high"]
+    low    = df["low"]
     volume = df["volume"]
+    n      = len(df)
 
-    period_high = close.max()
-    period_low = close.min()
-    price_range = period_high - period_low
-    position_pct = (current_price - period_low) / price_range * 100 if price_range > 0 else 50.0
+    # ── 1. 均线 ──────────────────────────────────────────────────
+    ma5  = close.tail(5).mean()
+    ma10 = close.tail(10).mean() if n >= 10 else None
+    ma20 = close.tail(20).mean() if n >= 20 else None
+    ma60 = close.tail(60).mean() if n >= 60 else None
 
-    ma5 = close.tail(5).mean()    # ≈ 1.25 交易日
-    ma20 = close.tail(20).mean()  # ≈ 5 交易日
-    ma5_trend = "上方" if current_price > ma5 else "下方"
-    ma20_trend = "上方" if current_price > ma20 else "下方"
+    ma_parts = []
+    for label, val in [("MA5", ma5), ("MA10", ma10), ("MA20", ma20), ("MA60", ma60)]:
+        if val is not None:
+            rel = "↑上方" if current_price > val else "↓下方"
+            ma_parts.append(f"{label}={val:.2f}({rel})")
 
-    vol5 = volume.tail(5).mean()
-    vol20 = volume.tail(20).mean()
-    vol_ratio = vol5 / vol20 if vol20 > 0 else 1.0
-    if vol_ratio > 1.2:
-        vol_desc = f"近5根均量是近20根均量的{vol_ratio:.1f}倍，明显放量"
-    elif vol_ratio < 0.8:
-        vol_desc = f"近5根均量是近20根均量的{vol_ratio:.1f}倍，明显缩量"
+    valid_mas = [v for v in [ma5, ma10, ma20, ma60] if v is not None]
+    if len(valid_mas) >= 3:
+        if all(valid_mas[i] > valid_mas[i + 1] for i in range(len(valid_mas) - 1)):
+            ma_order = "多头排列"
+        elif all(valid_mas[i] < valid_mas[i + 1] for i in range(len(valid_mas) - 1)):
+            ma_order = "空头排列"
+        else:
+            ma_order = "均线交叉/缠绕"
     else:
-        vol_desc = f"近5根与近20根均量相近（比值{vol_ratio:.2f}），量能平稳"
+        ma_order = ""
 
-    chg_5h = (current_price - close.iloc[-5]) / close.iloc[-5] * 100 if len(close) >= 5 else 0.0
-    chg_all = (current_price - close.iloc[0]) / close.iloc[0] * 100 if len(close) >= 2 else 0.0
+    # MA5/MA20 金死叉（前一根 vs 最新）
+    ma_cross = ""
+    if n >= 21 and ma20 is not None:
+        prev_ma5  = close.iloc[-6:-1].mean()
+        prev_ma20 = close.iloc[-21:-1].mean()
+        if prev_ma5 < prev_ma20 and ma5 >= ma20:
+            ma_cross = "⚠️ MA5上穿MA20（金叉）"
+        elif prev_ma5 > prev_ma20 and ma5 <= ma20:
+            ma_cross = "⚠️ MA5下穿MA20（死叉）"
 
+    # ── 2. MACD (12,26,9) ────────────────────────────────────────
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    dif   = ema12 - ema26
+    dea   = dif.ewm(span=9, adjust=False).mean()
+    hist  = (dif - dea) * 2
+
+    dif_v     = dif.iloc[-1]
+    dea_v     = dea.iloc[-1]
+    hist_v    = hist.iloc[-1]
+    hist_prev = hist.iloc[-2] if n >= 2 else hist_v
+    dif_prev  = dif.iloc[-2]  if n >= 2 else dif_v
+    dea_prev  = dea.iloc[-2]  if n >= 2 else dea_v
+
+    macd_cross = ""
+    if dif_prev < dea_prev and dif_v >= dea_v:
+        macd_cross = "⚠️ MACD金叉（DIF上穿DEA）"
+    elif dif_prev > dea_prev and dif_v <= dea_v:
+        macd_cross = "⚠️ MACD死叉（DIF下穿DEA）"
+
+    above_zero = "零轴上方" if dif_v > 0 else "零轴下方"
+    if hist_v > 0:
+        hist_desc = "红柱" + ("扩大" if hist_v > hist_prev else "缩小")
+    else:
+        hist_desc = "绿柱" + ("扩大" if hist_v < hist_prev else "缩小")
+
+    # ── 3. RSI (14) ──────────────────────────────────────────────
+    delta    = close.diff()
+    gain     = delta.clip(lower=0)
+    loss     = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
+    rs       = avg_gain / avg_loss.replace(0, float("nan"))
+    rsi14    = (100 - 100 / (1 + rs)).iloc[-1]
+
+    if rsi14 >= 80:
+        rsi_status = "强超买区（>80）"
+    elif rsi14 >= 70:
+        rsi_status = "超买区（70~80，注意回调）"
+    elif rsi14 <= 20:
+        rsi_status = "强超卖区（<20）"
+    elif rsi14 <= 30:
+        rsi_status = "超卖区（20~30，关注反弹）"
+    elif rsi14 >= 50:
+        rsi_status = "偏强（50~70）"
+    else:
+        rsi_status = "偏弱（30~50）"
+
+    # ── 4. KDJ (9,3,3) ───────────────────────────────────────────
+    low_min  = low.rolling(9, min_periods=1).min()
+    high_max = high.rolling(9, min_periods=1).max()
+    denom    = (high_max - low_min).replace(0, float("nan"))
+    rsv      = ((close - low_min) / denom * 100).fillna(50)
+    k_line   = rsv.ewm(alpha=1 / 3, adjust=False).mean()
+    d_line   = k_line.ewm(alpha=1 / 3, adjust=False).mean()
+    j_line   = 3 * k_line - 2 * d_line
+    k_v, d_v, j_v = k_line.iloc[-1], d_line.iloc[-1], j_line.iloc[-1]
+
+    if j_v > 90:
+        kdj_status = "J值超买（>90）"
+    elif j_v < 10:
+        kdj_status = "J值超卖（<10）"
+    elif k_v > d_v:
+        kdj_status = "K在D上方（偏多）"
+    else:
+        kdj_status = "K在D下方（偏空）"
+
+    # ── 5. 布林带 (20,2) ─────────────────────────────────────────
+    if n >= 20:
+        bb_mid   = close.rolling(20).mean().iloc[-1]
+        bb_std   = close.rolling(20).std(ddof=1).iloc[-1]
+        bb_upper = bb_mid + 2 * bb_std
+        bb_lower = bb_mid - 2 * bb_std
+        bb_width = (bb_upper - bb_lower) / bb_mid * 100 if bb_mid > 0 else 0
+
+        if current_price >= bb_upper * 0.99:
+            bb_pos = "触及/突破上轨（强势或超买信号）"
+        elif current_price <= bb_lower * 1.01:
+            bb_pos = "触及/跌破下轨（弱势或超卖信号）"
+        else:
+            pct_in_band = (
+                (current_price - bb_lower) / (bb_upper - bb_lower) * 100
+                if (bb_upper - bb_lower) > 0 else 50
+            )
+            bb_pos = f"布林带内部{pct_in_band:.0f}%位置"
+
+        bb_line = (
+            f"上轨{bb_upper:.2f} / 中轨{bb_mid:.2f} / 下轨{bb_lower:.2f}，"
+            f"{bb_pos}，带宽{bb_width:.1f}%"
+        )
+    else:
+        bb_line = "（数据不足，无法计算布林带）"
+
+    # ── 6. 成交量 ─────────────────────────────────────────────────
+    vol5  = volume.tail(5).mean()
+    vol20 = volume.tail(20).mean() if n >= 20 else volume.mean()
+    vol_ratio = vol5 / vol20 if vol20 > 0 else 1.0
+
+    if vol_ratio >= 2.0:
+        vol_desc = f"近5日均量是20日均量的{vol_ratio:.1f}倍，异常放量"
+    elif vol_ratio >= 1.5:
+        vol_desc = f"近5日均量是20日均量的{vol_ratio:.1f}倍，显著放量"
+    elif vol_ratio >= 1.2:
+        vol_desc = f"近5日均量是20日均量的{vol_ratio:.1f}倍，温和放量"
+    elif vol_ratio <= 0.5:
+        vol_desc = f"近5日均量是20日均量的{vol_ratio:.1f}倍，深度缩量"
+    elif vol_ratio <= 0.8:
+        vol_desc = f"近5日均量是20日均量的{vol_ratio:.1f}倍，明显缩量"
+    else:
+        vol_desc = f"近5日均量与20日均量相当（比值{vol_ratio:.2f}），量能平稳"
+
+    last_vol_ratio = volume.iloc[-1] / vol20 if vol20 > 0 else 1.0
+    last_vol_tag   = (
+        "明显放量" if last_vol_ratio >= 1.5
+        else "缩量" if last_vol_ratio <= 0.7
+        else "正常"
+    )
+    last_vol_desc = f"最新一根成交量为20日均量的{last_vol_ratio:.1f}倍（{last_vol_tag}）"
+
+    # ── 7. 价格区间与涨跌幅 ───────────────────────────────────────
+    period_high   = close.max()
+    period_low    = close.min()
+    price_range   = period_high - period_low
+    position_pct  = (current_price - period_low) / price_range * 100 if price_range > 0 else 50.0
+    recent20_high = high.tail(20).max() if n >= 20 else high.max()
+    recent20_low  = low.tail(20).min()  if n >= 20 else low.min()
+
+    chg_5d  = (current_price - close.iloc[-5])  / close.iloc[-5]  * 100 if n >= 5  else 0.0
+    chg_20d = (current_price - close.iloc[-20]) / close.iloc[-20] * 100 if n >= 20 else 0.0
+    chg_all = (current_price - close.iloc[0])   / close.iloc[0]   * 100 if n >= 2  else 0.0
+
+    # ── 8. K线形态 ────────────────────────────────────────────────
+    recent5   = df.tail(5)
+    up_days   = int((recent5["close"] >= recent5["open"]).sum())
+    down_days = 5 - up_days
+
+    # 连续涨跌计数
+    streak, streak_dir = 1, ("up" if df.iloc[-1]["close"] >= df.iloc[-1]["open"] else "down")
+    for i in range(len(df) - 2, max(len(df) - 10, -1), -1):
+        d = "up" if df.iloc[i]["close"] >= df.iloc[i]["open"] else "down"
+        if d == streak_dir:
+            streak += 1
+        else:
+            break
+    streak_desc = (
+        f"连续{'上涨' if streak_dir == 'up' else '下跌'}{streak}根K线"
+        if streak >= 2 else "近期无连续涨跌"
+    )
+
+    # 最新K线：实体 + 上下影线
+    last      = df.iloc[-1]
+    body      = abs(last["close"] - last["open"])
+    body_pct  = body / last["open"] * 100 if last["open"] > 0 else 0
+    upper_shd = last["high"] - max(last["close"], last["open"])
+    lower_shd = min(last["close"], last["open"]) - last["low"]
+    candle_t  = "阳线" if last["close"] >= last["open"] else "阴线"
+
+    if body_pct >= 3:
+        candle_desc = f"大{candle_t}（实体{body_pct:.1f}%）"
+    elif body_pct < 0.3:
+        candle_desc = f"十字星/小实体（{body_pct:.1f}%），多空分歧"
+    else:
+        candle_desc = f"{candle_t}（实体{body_pct:.1f}%）"
+
+    if upper_shd > body * 1.5 and body > 0:
+        candle_desc += "，上影线长（上方压力大）"
+    if lower_shd > body * 1.5 and body > 0:
+        candle_desc += "，下影线长（下方支撑强）"
+
+    # ── 拼装 ─────────────────────────────────────────────────────
     summary = (
-        f"【{stock_name}】技术面摘要（近5个交易日日K）：\n"
+        f"【{stock_name}】技术面综合摘要（近{n}个交易日日K）：\n"
+        f"\n▌ 价格与区间\n"
         f"- 当前价：{current_price:.2f}元\n"
-        f"- 本周价格区间：{period_low:.2f} ~ {period_high:.2f}，当前处于区间{position_pct:.1f}%分位\n"
-        f"- MA5={ma5:.2f}，MA20={ma20:.2f}，当前价在MA5{ma5_trend}、MA20{ma20_trend}\n"
-        f"- 本周涨跌：{chg_all:+.2f}%，昨日涨跌：{chg_5h:+.2f}%\n"
-        f"- 成交量：{vol_desc}"
+        f"- 近{n}日区间：{period_low:.2f} ~ {period_high:.2f}，当前处于{position_pct:.1f}%分位\n"
+        f"- 近20日关键位：压力{recent20_high:.2f} / 支撑{recent20_low:.2f}\n"
+        f"- 涨跌幅：近5日{chg_5d:+.2f}%，近20日{chg_20d:+.2f}%，期间累计{chg_all:+.2f}%\n"
+        f"\n▌ 均线系统\n"
+        f"- {' / '.join(ma_parts)}\n"
+        + (f"- 排列形态：{ma_order}\n" if ma_order else "")
+        + (f"- {ma_cross}\n" if ma_cross else "")
+        + f"\n▌ MACD (12,26,9)\n"
+        f"- DIF={dif_v:+.3f}，DEA={dea_v:+.3f}，柱={hist_v:+.3f}（{above_zero}，{hist_desc}）\n"
+        + (f"- {macd_cross}\n" if macd_cross else "")
+        + f"\n▌ RSI & KDJ\n"
+        f"- RSI(14)={rsi14:.1f}，{rsi_status}\n"
+        f"- KDJ：K={k_v:.1f}，D={d_v:.1f}，J={j_v:.1f}，{kdj_status}\n"
+        f"\n▌ 布林带 (20,2)\n"
+        f"- {bb_line}\n"
+        f"\n▌ 成交量\n"
+        f"- {vol_desc}\n"
+        f"- {last_vol_desc}\n"
+        f"\n▌ K线形态（近5日）\n"
+        f"- {up_days}阳{down_days}阴，{streak_desc}\n"
+        f"- 最新K线：{candle_desc}\n"
     )
     return summary
 
@@ -146,7 +347,7 @@ async def get_stock_tech_data(
     # 图表展示最近60根（约60个交易日）
     df = df.tail(60).reset_index(drop=True)
 
-    # 技术摘要只取最近5根（近一周），供 Kimi 分析
-    tech_summary = _build_tech_summary(df.tail(5), stock_name, current_price)
+    # 技术摘要使用全量数据，以便计算 MACD/RSI/KDJ/布林带等多周期指标
+    tech_summary = _build_tech_summary(df, stock_name, current_price)
     logger.info(f"[SayuStock] 技术面摘要生成完成: {stock_name}({stock_code}) [{market_name}]")
     return stock_name, stock_code, market_name, df, tech_summary, current_price, chg_amount, chg_pct
