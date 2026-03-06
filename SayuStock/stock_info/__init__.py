@@ -6,7 +6,7 @@ from gsuid_core.models import Event
 
 from .draw_info import draw_info_img
 from .draw_future import draw_future_img
-from .draw_my_info import draw_my_stock_img
+from .draw_my_info import draw_my_stock_img, draw_user_stock_img
 from .draw_fund_info import draw_fund_info
 
 sv_stock_info = SV("大盘概览")
@@ -32,6 +32,22 @@ async def send_stock_info(bot: Bot, ev: Event):
 async def send_my_stock(bot: Bot, ev: Event):
     logger.info("[SayuStock] 开始执行[我的自选]")
     await bot.send(await draw_my_stock_img(ev))
+
+
+@sv_my_stock.on_regex(r"^(\d{5,20})的自选$", block=True)
+async def send_other_user_stock(bot: Bot, ev: Event):
+    target_qq = ev.regex_group[0] if ev.regex_group else ""
+    if not target_qq:
+        return await bot.send("请输入正确的QQ号，例如：12345678的自选")
+
+    logger.info(f"[SayuStock] 开始执行[{target_qq}的自选]")
+    await bot.send(
+        await draw_user_stock_img(
+            target_qq,
+            ev.bot_id,
+            f"QQ号 {target_qq} 还未添加自选呢~请输入 添加自选 查看帮助!",
+        )
+    )
 
 
 @sv_my_stock.on_fullmatch(("全天候", "全天候板块"))

@@ -81,10 +81,19 @@ def draw_bar(
 
 async def draw_my_stock_img(ev: Event):
     user_id = ev.at if ev.at else ev.user_id
-    uid = await SsBind.get_uid_list_by_game(user_id, ev.bot_id)
+    empty_msg = "对方还未添加自选呢~请输入 添加自选 查看帮助!" if ev.at else "您还未添加自选呢~请输入 添加自选 查看帮助!"
+    return await draw_user_stock_img(user_id, ev.bot_id, empty_msg)
+
+
+async def draw_user_stock_img(
+    user_id: str,
+    bot_id: str,
+    empty_msg: str = "您还未添加自选呢~请输入 添加自选 查看帮助!",
+):
+    uid = await SsBind.get_uid_list_by_game(user_id, bot_id)
 
     if not uid:
-        return "您还未添加自选呢~请输入 添加自选 查看帮助!"
+        return empty_msg
 
     uid = convert_list(uid)
     data_zs = await get_mtdata("主要指数", pz=100)

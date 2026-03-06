@@ -1,5 +1,5 @@
 """技术面数据整合：K线 + 成交量分析"""
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 import logging
 
 import pandas as pd
@@ -18,6 +18,25 @@ try:
 except ImportError:
     _HAS_FRAMEWORK = False
     ErroText = {"notStock": "未找到该股票"}  # type: ignore
+
+
+INVALID_NUM_TOKENS = {"", "-", "--", "null", "None", "nan", "NaN"}
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip().replace(",", "")
+    if text in INVALID_NUM_TOKENS:
+        return default
+
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return default
 
 
 def _parse_kline_df(raw_data: Dict) -> Optional[pd.DataFrame]:
@@ -328,12 +347,12 @@ async def get_stock_tech_data(
 
     # f58 格式为 "贵州茅台 (A)"，去掉括号后缀
     stock_name: str = basic["data"].get("f58", code).split("(")[0].strip()
-    current_price: float = float(basic["data"].get("f43", 0) or 0)
+    current_price: float = _safe_float(basic["data"].get("f43", 0), 0.0)
 
     raw_chg_amt = basic["data"].get("f169", 0)
     raw_chg_pct = basic["data"].get("f170", 0)
-    chg_amount: float = float(raw_chg_amt) if not isinstance(raw_chg_amt, str) else 0.0
-    chg_pct: float = float(raw_chg_pct) if not isinstance(raw_chg_pct, str) else 0.0
+    chg_amount: float = _safe_float(raw_chg_amt, 0.0)
+    chg_pct: float = _safe_float(raw_chg_pct, 0.0)
 
     # 获取日K（近60个交易日，用于图表展示）
     kline_raw = await get_gg(sec_id, "single-stock-kline-101")

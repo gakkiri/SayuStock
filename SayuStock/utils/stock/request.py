@@ -11,6 +11,7 @@ from aiohttp import (
     ClientSession,
     ClientTimeout,
     ContentTypeError,
+    ClientConnectionError,
     ServerDisconnectedError,
 )
 from playwright.async_api import async_playwright
@@ -31,6 +32,7 @@ from ..constant import (
     header_simple,
     request_header,
     trade_detail_dict,
+    i_code,
 )
 from ..load_data import get_full_security_code
 from .request_utils import get_code_id
@@ -39,6 +41,213 @@ from ...stock_config.stock_config import STOCK_CONFIG
 MENU_CACHE = {}
 DC_TOKEN = ""
 NOW_QUEUE = 0
+
+INVALID_NUM_TOKENS = {"", "-", "--", "null", "None", "nan", "NaN"}
+BROWSER_REQUEST_TIMEOUT = 15000
+ULIST_FIELDS = "f12,f13,f14,f1,f2,f4,f3,f152,f20,f8,f104,f105,f128,f140,f141,f207,f208,f209,f136,f222"
+ULIST_UT = "fa5fd1943c7b386f172d6893dbfba10b"
+ULIST_WBP2U = "|0|0|0|web"
+MAJOR_INDEX_NAMES = (
+    "上证指数",
+    "深证成指",
+    "创业板指",
+    "沪深300",
+    "中证A500",
+    "中证2000",
+    "中证1000",
+    "中证500",
+    "中证全指",
+    "科创综指",
+    "北证50",
+    "上证50",
+    "国债指数",
+)
+
+
+def _normalize_em_url(url: str) -> str:
+    if url.startswith("http://push2.eastmoney.com"):
+        return "https://" + url[len("http://") :]
+    if url.startswith("http://push2his.eastmoney.com"):
+        return "https://" + url[len("http://") :]
+    return url
+
+
+def _can_use_browser_fallback(url: str) -> bool:
+    return url.startswith((
+        "https://push2.eastmoney.com/",
+        "https://push2his.eastmoney.com/",
+    ))
+
+
+async def _browser_stock_request(final_url: str) -> Union[Dict, int]:
+    logger.warning(f"[SayuStock] 直连失败，尝试浏览器上下文请求: {final_url}")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = await browser.new_context(
+            user_agent=UA,
+            viewport={"width": 1366, "height": 768},
+        )
+        page = await context.new_page()
+
+        try:
+            try:
+                await page.goto(
+                    "https://quote.eastmoney.com/",
+                    wait_until="domcontentloaded",
+                    timeout=BROWSER_REQUEST_TIMEOUT,
+                )
+            except Exception as e:
+                logger.warning(f"[SayuStock] 浏览器预热失败，继续请求接口: {e}")
+
+            response = await page.goto(
+                final_url,
+                wait_until="domcontentloaded",
+                timeout=BROWSER_REQUEST_TIMEOUT,
+            )
+            if response is None:
+                logger.warning(f"[SayuStock] 浏览器请求未返回响应: {final_url}")
+                return -999
+
+            raw_text = await response.text()
+            try:
+                return json.loads(raw_text)
+            except json.JSONDecodeError:
+                logger.warning(f"[SayuStock] 浏览器请求返回非JSON: {raw_text[:200]}")
+                return -999
+        finally:
+            await browser.close()
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip().replace(",", "")
+    if text in INVALID_NUM_TOKENS:
+        return default
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+
+    text = str(value).strip().replace(",", "")
+    if text in INVALID_NUM_TOKENS:
+        return default
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        return default
+
+
+def _chunked(items: List[str], size: int) -> List[List[str]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _sort_diff_items(items: List[Dict[str, Any]], po: int, pz: int) -> List[Dict[str, Any]]:
+    reverse = po == 1
+    return sorted(items, key=lambda item: _safe_float(item.get("f3", 0.0)), reverse=reverse)[:pz]
+
+
+def _wrap_mtdata_result(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "rc": 0,
+        "rt": 1,
+        "svr": 0,
+        "lt": 1,
+        "full": 1,
+        "dlmkts": "",
+        "data": {"total": len(items), "diff": items},
+    }
+
+
+async def _fetch_ulist_diff(secids: List[str]) -> Union[List[Dict[str, Any]], int]:
+    if not secids:
+        return []
+
+    url = "https://push2.eastmoney.com/api/qt/ulist/get"
+    all_items: List[Dict[str, Any]] = []
+    for chunk in _chunked(secids, 80):
+        params = [
+            ("fltt", "1"),
+            ("invt", "2"),
+            ("fields", ULIST_FIELDS),
+            ("secids", ",".join(chunk)),
+            ("ut", ULIST_UT),
+            ("pn", "1"),
+            ("np", "1"),
+            ("dect", "1"),
+            ("pz", str(max(len(chunk), 20))),
+            ("wbp2u", ULIST_WBP2U),
+        ]
+        resp = await stock_request(url, "GET", params=params)
+        if isinstance(resp, int):
+            return resp
+        data = resp.get("data") or {}
+        diff = data.get("diff")
+        if not isinstance(diff, list):
+            return -999
+        all_items.extend(diff)
+    return all_items
+
+
+async def _resolve_ulist_secids(market: str) -> Optional[List[str]]:
+    if market == "主要指数":
+        results = await asyncio.gather(*(get_code_id(name) for name in MAJOR_INDEX_NAMES))
+        secids: List[str] = []
+        seen = set()
+        for result in results:
+            if result is None:
+                continue
+            secid = result[0]
+            if secid not in seen:
+                seen.add(secid)
+                secids.append(secid)
+        return secids
+
+    if market in ("行业板块", "行业"):
+        menu = await get_menu(2)
+        return [f"90.{code}" for code in menu.values()]
+
+    if market in ("概念板块", "概念"):
+        menu = await get_menu(3)
+        return [f"90.{code}" for code in menu.values()]
+
+    if market == "国际市场":
+        return [code[2:] if code.startswith("i:") else code for code in i_code.values()]
+
+    return None
+
+
+async def _get_mtdata_via_ulist(
+    market: str,
+    po: int,
+    pz: int,
+) -> Optional[Union[Dict[str, Any], str]]:
+    secids = await _resolve_ulist_secids(market)
+    if secids is None:
+        return None
+
+    diff = await _fetch_ulist_diff(secids)
+    if isinstance(diff, int):
+        return f"[SayuStock] 错误代码: {diff}"
+
+    return _wrap_mtdata_result(_sort_diff_items(diff, po, pz))
 
 
 async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:
@@ -170,18 +379,22 @@ async def get_single_fig_data(secid: str):
         # 原始数据格式
         # "2024-12-31 14:05,15.63,15.62,15.63,15.61,3300,5154770.00,15.672"
         parts = item.split(",")
+        if len(parts) < 8:
+            logger.warning(f"[SayuStock] 分时数据格式异常，跳过: {item!r}")
+            continue
         # 原始时间格式为'2024-12-31 14:05'
         datetime = parts[0].split(" ") if len(parts[0]) > 0 else ["", ""]
+        time_text = datetime[1] if len(datetime) > 1 else ""
         stock_data.append(
             {
-                "datetime": datetime[1],
-                "price": float(parts[1]),
-                "open": float(parts[2]),
-                "high": float(parts[3]),
-                "low": float(parts[4]),
-                "amount": int(parts[5]),
-                "money": float(parts[6]),
-                "avg_price": float(parts[7]),
+                "datetime": time_text,
+                "price": _safe_float(parts[1]),
+                "open": _safe_float(parts[2]),
+                "high": _safe_float(parts[3]),
+                "low": _safe_float(parts[4]),
+                "amount": _safe_int(parts[5]),
+                "money": _safe_float(parts[6]),
+                "avg_price": _safe_float(parts[7]),
             }
         )
     return stock_data
@@ -363,6 +576,10 @@ async def get_mtdata(
     po: int = 1,  # 0为倒序，1为正序
     pz: int = 20,
 ):
+    ulist_result = await _get_mtdata_via_ulist(market, po, pz)
+    if ulist_result is not None:
+        return ulist_result
+
     params = [
         ("pz", str(pz)),
         ("po", str(po)),
@@ -373,7 +590,7 @@ async def get_mtdata(
         ("pn", "1"),
     ]
 
-    url = "http://push2.eastmoney.com/api/qt/clist/get"
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
     if market in market_dict:
         fs = market_dict[market]
     else:
@@ -488,13 +705,15 @@ async def stock_request(
     data: Optional[FormData] = None,
 ) -> Union[Dict, int]:
     global NOW_QUEUE
+    url = _normalize_em_url(url)
+    req_header = dict(header)
     logger.info(f"[SayuStock] 请求: {url}")
     logger.info(f"[SayuStock] Params: {params}")
 
     cookies = STOCK_CONFIG.get_config("eastmoney_cookie").data
     if cookies:
         logger.info(f"[SayuStock] Cookie: {cookies}")
-        header["Cookie"] = cookies
+        req_header["Cookie"] = cookies
 
     if url.startswith(
         (
@@ -504,11 +723,11 @@ async def stock_request(
             "https://quotederivates.eastmoney.com",
         )
     ):
-        header = header_simple
+        req_header = dict(header_simple)
 
     async with ClientSession(
         connector=TCPConnector(verify_ssl=True),
-        headers=header,
+        headers=req_header,
         cookies=DC_COOKIES,
     ) as client:
         final_url = str(URL(url).with_query(params or {}))
@@ -526,7 +745,6 @@ async def stock_request(
                     method,
                     url=final_url,
                     # headers=header,
-                    params=params,
                     json=_json,
                     data=data,
                     timeout=ClientTimeout(total=300),
@@ -542,9 +760,20 @@ async def stock_request(
                         logger.error(f"[SayuStock][EM] 访问 {url} 失败, 错误码: {resp.status}, 错误返回: {raw_data}")
                         return -999
                     return raw_data
-            except ServerDisconnectedError:
+            except (ServerDisconnectedError, ClientConnectionError):
                 logger.warning(f"[SayuStock] 请求 {url} 失败, 尝试获取DC-Token...")
-                # header['cookie'] = await get_dc_token()
+                try:
+                    dc_cookie = await get_dc_token()
+                    if dc_cookie:
+                        client.headers["Cookie"] = dc_cookie
+                except Exception as e:
+                    logger.warning(f"[SayuStock] 获取DC-Token失败: {e}")
+
+                if _can_use_browser_fallback(url):
+                    browser_result = await _browser_stock_request(final_url)
+                    if not isinstance(browser_result, int):
+                        return browser_result
+
                 await asyncio.sleep(random.uniform(0.2, 0.9))
             finally:
                 NOW_QUEUE -= 1
