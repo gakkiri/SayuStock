@@ -6,6 +6,7 @@ from gsuid_core.models import Event
 from .get_data import get_stock_tech_data
 from .llm_analyze import kimi_analyze
 from .draw_result import draw_analysis_img
+from .cache_utils import get_cached_analysis_image_for_query, save_cached_analysis_image
 
 sv_stock_analysis = SV("大盘分析")
 
@@ -21,6 +22,12 @@ async def send_stock_analysis(bot: Bot, ev: Event):
     await bot.send(f"正在分析【{code}】，请稍候...")
 
     try:
+        cached_image = await get_cached_analysis_image_for_query(code)
+        if cached_image is not None:
+            logger.info(f"[SayuStock][大盘分析] 命中30分钟图片缓存 code={code}")
+            await bot.send(cached_image, at_sender=True)
+            return
+
         logger.info("[SayuStock][大盘分析] 第1步: 获取技术面数据")
         stock_name, stock_code, market_name, df, tech_summary, cur_price, chg_amt, chg_pct = await get_stock_tech_data(code)
         if df is None:
@@ -30,7 +37,12 @@ async def send_stock_analysis(bot: Bot, ev: Event):
         logger.info(f"[SayuStock][大盘分析] 技术面数据OK: {stock_name}({stock_code}) [{market_name}], K线{len(df)}条")
 
         logger.info("[SayuStock][大盘分析] 第2步: 调用 Kimi 分析")
-        verdict, reason, risk, news_summary, sources = await kimi_analyze(stock_name, tech_summary)
+        verdict, reason, risk, news_summary, sources = await kimi_analyze(
+            stock_name,
+            stock_code,
+            market_name,
+            tech_summary,
+        )
         logger.info(f"[SayuStock][大盘分析] Kimi结果: verdict={verdict}, sources={sources}")
 
         logger.info("[SayuStock][大盘分析] 第3步: 渲染图片")
@@ -40,6 +52,12 @@ async def send_stock_analysis(bot: Bot, ev: Event):
             verdict, reason, risk, news_summary, sources,
         )
         logger.info("[SayuStock][大盘分析] 渲染完成，发送图片")
+
+        try:
+            save_cached_analysis_image(stock_code, im)
+            logger.info(f"[SayuStock][大盘分析] 已写入图片缓存 stock_code={stock_code}")
+        except Exception as e:
+            logger.warning(f"[SayuStock][大盘分析] 写入图片缓存失败 stock_code={stock_code}: {e}")
 
         await bot.send(im, at_sender=True)
 
@@ -52,4 +70,3 @@ async def send_stock_analysis(bot: Bot, ev: Event):
             await bot.send("AI 返回格式异常，请稍后重试")
         else:
             await bot.send(f"分析出错: {e}")
-

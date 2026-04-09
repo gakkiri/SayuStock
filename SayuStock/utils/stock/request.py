@@ -79,6 +79,21 @@ def _can_use_browser_fallback(url: str) -> bool:
     ))
 
 
+async def _try_browser_fallback(
+    url: str,
+    final_url: str,
+    reason: str,
+) -> Optional[Dict]:
+    if not _can_use_browser_fallback(url):
+        return None
+
+    logger.warning(f"[SayuStock] 请求 {url} 触发浏览器回退: {reason}")
+    browser_result = await _browser_stock_request(final_url)
+    if not isinstance(browser_result, int):
+        return browser_result
+    return None
+
+
 async def _browser_stock_request(final_url: str) -> Union[Dict, int]:
     logger.warning(f"[SayuStock] 直连失败，尝试浏览器上下文请求: {final_url}")
     async with async_playwright() as p:
@@ -751,13 +766,30 @@ async def stock_request(
                 ) as resp:
                     try:
                         raw_data = await resp.json()
-                    except (ContentTypeError, json.decoder.JSONDecodeError):
-                        _raw_data = await resp.text()
+                    except (ContentTypeError, json.decoder.JSONDecodeError) as e:
+                        try:
+                            _raw_data = await resp.text()
+                        except Exception:
+                            _raw_data = ""
+                        fallback_result = await _try_browser_fallback(
+                            url,
+                            final_url,
+                            f"响应解析失败: {type(e).__name__}",
+                        )
+                        if fallback_result is not None:
+                            return fallback_result
                         raw_data = -999
                     logger.debug(raw_data)
 
                     if resp.status != 200:
                         logger.error(f"[SayuStock][EM] 访问 {url} 失败, 错误码: {resp.status}, 错误返回: {raw_data}")
+                        fallback_result = await _try_browser_fallback(
+                            url,
+                            final_url,
+                            f"HTTP状态码异常: {resp.status}",
+                        )
+                        if fallback_result is not None:
+                            return fallback_result
                         return -999
                     return raw_data
             except (ServerDisconnectedError, ClientConnectionError):
@@ -769,12 +801,24 @@ async def stock_request(
                 except Exception as e:
                     logger.warning(f"[SayuStock] 获取DC-Token失败: {e}")
 
-                if _can_use_browser_fallback(url):
-                    browser_result = await _browser_stock_request(final_url)
-                    if not isinstance(browser_result, int):
-                        return browser_result
+                fallback_result = await _try_browser_fallback(
+                    url,
+                    final_url,
+                    "连接异常",
+                )
+                if fallback_result is not None:
+                    return fallback_result
 
                 await asyncio.sleep(random.uniform(0.2, 0.9))
+            except Exception as e:
+                fallback_result = await _try_browser_fallback(
+                    url,
+                    final_url,
+                    f"{type(e).__name__}: {e}",
+                )
+                if fallback_result is not None:
+                    return fallback_result
+                raise
             finally:
                 NOW_QUEUE -= 1
         else:
