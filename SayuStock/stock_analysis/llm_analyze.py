@@ -105,6 +105,13 @@ def _parse_date(value: Any) -> Optional[date]:
         return None
 
 
+def _is_future_date(value: Any, today: Optional[date] = None) -> bool:
+    published = _parse_date(value)
+    if published is None:
+        return False
+    return published > (today or date.today())
+
+
 def _build_prefetch_requests(stock_name: str) -> List[Dict[str, Any]]:
     requests = [
         {
@@ -152,6 +159,9 @@ def _normalize_prefetched_item(
     source_name = _extract_source_name(raw)
 
     if not title and not summary:
+        return None
+
+    if _is_future_date(published_date):
         return None
 
     if not title:
@@ -276,6 +286,7 @@ def _build_system_prompt() -> str:
         f"用户消息中会附带【前置搜索舆情】材料，其中包含宏观与个股新闻，你必须优先引用【前置搜索舆情】。"
         f"在输出最终 JSON 之前，必须至少调用一次 $web_search 进行补充搜索或交叉验证。"
         f"个股新闻、公告、时事热点原则上只使用30天内且有明确日期的材料；若30天内完全没有任何信源，才可回退到更早但仍相关的有日期材料。"
+        f"严禁引用晚于今天的未来日期信源。"
         f"前置搜索舆情可以直接写入 sources 字段。"
         f"搜索完成后，【直接】以 JSON 格式输出分析结论，不得输出任何其他文字。\n"
         f"JSON 必须严格包含以下字段：\n"
@@ -336,6 +347,8 @@ def _parse_kimi_source(source_text: str) -> Optional[Tuple[date, str]]:
     published = _parse_date(match.group("date"))
     if published is None:
         return None
+    if published > date.today():
+        return None
     source_name = match.group("source").strip()
     content = match.group("content").strip()
     if not source_name or not content:
@@ -349,6 +362,7 @@ def _merge_display_sources(
     kimi_sources: List[str],
     limit: int = MAX_DISPLAY_SOURCES,
 ) -> List[str]:
+    today = date.today()
     cutoff = date.today() - timedelta(days=NEWS_LOOKBACK_DAYS)
     recent_candidates: List[Tuple[date, str]] = []
     older_candidates: List[Tuple[date, str]] = []
@@ -358,6 +372,8 @@ def _merge_display_sources(
         published = _parse_date(item.published_date)
         formatted = _format_prefetched_display_source(item)
         if published is None or formatted is None:
+            continue
+        if published > today:
             continue
         if formatted in seen_texts:
             continue
