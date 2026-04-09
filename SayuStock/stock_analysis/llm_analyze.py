@@ -303,7 +303,7 @@ def _build_user_prompt(
     )
     return (
         f"{tech_summary}\n\n"
-        f"今天是 {today}。以上技术面/K线摘要来自机器人侧提供的近半年窗口数据，请直接基于该摘要分析，不要擅自改写技术面时间范围。\n\n"
+        f"今天是 {today}。以上技术面/K线摘要来自机器人侧提供的近60个交易日数据，请直接基于该摘要分析，不要擅自改写技术面时间范围。\n\n"
         f"{prefetched_section}"
         f"请针对 {stock_hint} 执行分析：\n"
         f"1. 必须至少调用一次 $web_search，对该股近30天的新闻、公告、时事热点进行补充搜索或交叉验证；\n"

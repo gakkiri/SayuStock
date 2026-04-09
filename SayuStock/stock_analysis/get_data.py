@@ -363,8 +363,8 @@ async def get_stock_tech_data(
     if df is None or df.empty:
         return None, None, None, None, "无有效K线数据", 0.0, 0.0, 0.0
 
-    # `single-stock-kline-101` 已按近半年窗口请求，保留整段数据给图表与技术面摘要
-    df = df.reset_index(drop=True)
+    # 图表展示与技术面分析统一使用最近60个交易日，避免时间窗口过长稀释短中期信号
+    df = df.tail(60).reset_index(drop=True)
 
     tech_summary = _build_tech_summary(df, stock_name, current_price)
     logger.info(f"[SayuStock] 技术面摘要生成完成: {stock_name}({stock_code}) [{market_name}]")
