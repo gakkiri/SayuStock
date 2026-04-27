@@ -6,6 +6,7 @@ import logging
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -85,14 +86,16 @@ def _normalize_date_text(value: Any) -> str:
     text = str(value).strip()
     if not text:
         return ""
-    if "T" in text:
-        text = text.split("T", 1)[0]
-    if " " in text:
-        text = text.split(" ", 1)[0]
+
     match = re.search(r"\d{4}-\d{2}-\d{2}", text)
-    if not match:
+    if match:
+        return match.group(0)
+
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
         return ""
-    return match.group(0)
+    return parsed.date().strftime("%Y-%m-%d")
 
 
 def _parse_date(value: Any) -> Optional[date]:

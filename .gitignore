@@ -675,3 +675,5 @@ testnb2/
 
 em_data
 .claude
+.codex
+tests/
